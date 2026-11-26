@@ -25,7 +25,8 @@ Vaultwarden vault without seeing their values. On top of rbw 1.15.0 it adds:
   `rbw run` (see [Template and command
   injection](#template-and-command-injection)).
 * `rbw run` masks the resolved secret values in the command's stdout and
-  stderr as `<concealed by rbw>`, also when a value is split across writes.
+  stderr as `<concealed by rbw>`, also when a value is split across writes,
+  together with their base64, hex, URL-encoded and JSON-escaped forms.
   `--no-masking` turns this off.
 * `rbw run --lock`, or the `lock_after_run` config option, locks the agent
   right after resolving secrets and before starting the command, so every run
@@ -112,10 +113,12 @@ to enforce them.
 
 Limits:
 
-* Masking only prevents accidental leaks. It masks exact values (and each
-  line of multi-line values); transformed values (base64, URL encoding, ...)
-  are not masked, and values shorter than 4 bytes are not masked at all (a
-  warning is printed).
+* Masking only prevents accidental leaks and simple tricks. It masks exact
+  values, each line of multi-line values, and their base64 (standard and
+  URL-safe, at any offset), hex, URL-encoded and JSON-escaped forms. Anything
+  else (reversed, split up, compressed, line-wrapped base64 or hex, ...) is
+  not masked, so a command written to leak a secret still can. Values shorter
+  than 4 bytes are not masked at all (a warning is printed).
 * The real barrier is typing the master password on profiles with
   `lock_after_run`. pinentry does not show which command is asking, so cancel
   prompts you did not expect.
@@ -281,7 +284,8 @@ rbw run -- env
 rbw run --env-file .env.local -- docker compose up -d
 ```
 
-The resolved secret values are masked in the command's output as
+The resolved secret values (and their base64, hex, URL-encoded and
+JSON-escaped forms) are masked in the command's output as
 `<concealed by rbw>`; pass `--no-masking` to run the command with the
 terminal attached and nothing masked. `--lock` (or the `lock_after_run`
 config option) locks the agent once the secrets are resolved, before the

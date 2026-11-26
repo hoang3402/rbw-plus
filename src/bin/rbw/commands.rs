@@ -3564,6 +3564,16 @@ fn child_command_name(command: &[OsString]) -> String {
 
 const RUN_MASK: &[u8] = b"<concealed by rbw>";
 const RUN_MASK_MIN_LEN: usize = 4;
+// encoded forms are only masked from this length on, so that short fragments
+// do not mask unrelated output
+const RUN_MASK_MIN_ENCODED_LEN: usize = 8;
+// like encodeURIComponent: everything but letters, digits and -_.~
+const RUN_URL_ENCODE_SET: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
 const RUN_OUTPUT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(1);
 
@@ -3584,6 +3594,11 @@ struct OutputMasker {
 impl OutputMasker {
     fn new(values: &[String]) -> Self {
         let mut secrets: Vec<Vec<u8>> = vec![];
+        let mut add = |pattern: Vec<u8>, min_len: usize| {
+            if pattern.len() >= min_len && !secrets.contains(&pattern) {
+                secrets.push(pattern);
+            }
+        };
         for value in values {
             // also mask each line of multi-line values (notes, pem keys)
             let lines = value
@@ -3592,11 +3607,12 @@ impl OutputMasker {
                 .into_iter()
                 .flatten();
             for part in std::iter::once(value.as_str()).chain(lines) {
-                let part = part.as_bytes();
-                if part.len() >= RUN_MASK_MIN_LEN
-                    && !secrets.iter().any(|secret| secret == part)
-                {
-                    secrets.push(part.to_vec());
+                if part.len() < RUN_MASK_MIN_LEN {
+                    continue;
+                }
+                add(part.as_bytes().to_vec(), RUN_MASK_MIN_LEN);
+                for encoded in encoded_forms(part) {
+                    add(encoded, RUN_MASK_MIN_ENCODED_LEN);
                 }
             }
         }
@@ -3650,6 +3666,49 @@ impl OutputMasker {
         }
         (masked, input.len())
     }
+}
+
+// common encodings in which a secret ends up in output without being copied
+// verbatim: base64 (standard and url-safe), hex, url encoding, and json string
+// escaping. this only catches accidents and simple tricks; any other
+// transformation (reversing, splitting, compressing, ...) is not masked.
+fn encoded_forms(secret: &str) -> Vec<Vec<u8>> {
+    use base64::Engine as _;
+
+    let bytes = secret.as_bytes();
+    let mut forms = vec![];
+    // the base64 encoding of the secret depends on where it starts relative
+    // to the 3-byte groups of the encoded data, so for each of the three
+    // alignments keep only the characters that encode bytes of the secret
+    for offset in 0..3 {
+        let mut input = vec![0_u8; offset];
+        input.extend_from_slice(bytes);
+        let encoded =
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(&input);
+        let start = (offset * 4).div_ceil(3);
+        let end = (offset + bytes.len()) * 4 / 3;
+        if let Some(core) = encoded.get(start..end) {
+            forms.push(core.as_bytes().to_vec());
+            forms.push(core.replace('+', "-").replace('/', "_").into_bytes());
+        }
+    }
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    forms.push(hex.to_uppercase().into_bytes());
+    forms.push(hex.into_bytes());
+    forms.push(
+        percent_encoding::utf8_percent_encode(secret, RUN_URL_ENCODE_SET)
+            .to_string()
+            .into_bytes(),
+    );
+    if let Ok(json) = serde_json::to_string(secret) {
+        if let Some(escaped) = json.get(1..json.len() - 1) {
+            forms.push(escaped.as_bytes().to_vec());
+        }
+    }
+    forms
 }
 
 fn write_flushed<W: std::io::Write>(
@@ -6164,6 +6223,74 @@ mod test {
                 ),
                 b"abc <concealed by rbw> x"
             );
+        }
+
+        #[test]
+        fn test_output_masker_masks_base64_at_any_alignment() {
+            use base64::Engine as _;
+
+            let secret = "dev-token-test-9f8e7d6c";
+            let engines = [
+                base64::engine::general_purpose::STANDARD,
+                base64::engine::general_purpose::URL_SAFE,
+            ];
+            for prefix in ["", "a", "ab", "token="] {
+                for engine in &engines {
+                    let encoded =
+                        engine.encode(format!("{prefix}{secret}\n"));
+                    let masked = String::from_utf8(mask_all(
+                        &[secret],
+                        &[encoded.as_bytes()],
+                    ))
+                    .unwrap();
+                    assert!(
+                        masked.contains("<concealed by rbw>"),
+                        "{prefix:?}: {masked}"
+                    );
+                    // only the characters that mix in the prefix or the
+                    // trailing newline are left
+                    let leftover = masked.replace("<concealed by rbw>", "");
+                    assert!(
+                        leftover.len() <= prefix.len() * 4 / 3 + 6,
+                        "{prefix:?}: {masked}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_output_masker_masks_hex_url_and_json_forms() {
+            let secret = "p@ss/w\"0rd+x\\y";
+            let mut hex = String::new();
+            for byte in secret.as_bytes() {
+                write!(hex, "{byte:02x}").unwrap();
+            }
+            for form in [
+                hex.clone(),
+                hex.to_uppercase(),
+                "p%40ss%2Fw%220rd%2Bx%5Cy".to_string(),
+                "p@ss/w\\\"0rd+x\\\\y".to_string(),
+            ] {
+                let input = format!("[{form}]");
+                assert_eq!(
+                    mask_all(&[secret], &[input.as_bytes()]),
+                    b"[<concealed by rbw>]",
+                    "{form}"
+                );
+            }
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn test_run_masked_command_masks_base64_output() {
+            let (status, stdout, _) = run_masked_sh(
+                "printf '%s\\n' \"$API_TOKEN\" | base64",
+                &[("API_TOKEN", "dev-token-test-9f8e7d6c")],
+                &["dev-token-test-9f8e7d6c"],
+            );
+            assert!(status.success());
+            assert!(stdout.starts_with("<concealed by rbw>"), "{stdout}");
+            assert!(!stdout.contains("ZGV2LXRva2Vu"), "{stdout}");
         }
 
         #[derive(Clone, Default)]

@@ -4,8 +4,9 @@
 
 ## Added
 
-* `rbw run` masks the resolved secret values in the command's stdout and
-  stderr; `--no-masking` disables it.
+* `rbw run` masks the resolved secret values, and their base64, hex,
+  URL-encoded and JSON-escaped forms, in the command's stdout and stderr;
+  `--no-masking` disables it.
 * `rbw run --lock` and the `lock_after_run` config option lock the agent
   after resolving secrets, before the command starts.
 
