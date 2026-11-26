@@ -31,11 +31,17 @@ Vaultwarden vault without seeing their values. On top of rbw 1.15.0 it adds:
   right after resolving secrets and before starting the command, so every run
   asks for the master password again.
 
-Status: #386 and #323 are merged as submitted. The masking and locking code is
-covered by unit tests (masking, exit status, background children), but none of
-this has been run against a live server yet, including the 422 fix and the
-password prompt after a lock. The version is bumped to `1.15.1-plus.1` so that
-a stock `rbw-agent` is not mistaken for this one.
+Status: #386 and #323 are merged as submitted. Tested by hand against
+Vaultwarden 1.37.2 on macOS with pinentry-mac: `rbw login`, `rbw add`,
+`rbw edit`, and `rbw run` (masked stdout and stderr, `--no-masking`, exit
+status, piping into `head`, and a fresh master password prompt on every run
+of a profile with `lock_after_run`). The masking code also has unit tests.
+The version is bumped to `1.15.1-plus.1` so that a stock `rbw-agent` is not
+mistaken for this one.
+
+Note that `rbw add` and `rbw edit` read the entry from stdin instead of
+opening an editor when stdin is not a terminal (as in upstream), so set values
+with `printf '%s\n' "$value" | rbw edit NAME`.
 
 ### Installing
 
