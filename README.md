@@ -11,6 +11,117 @@ similar to the way that `ssh-agent` or `gpg-agent` work. This allows the client
 to be used in a much simpler way, with the background agent taking care of
 maintaining the necessary state.
 
+## About this fork (rbw-plus)
+
+rbw-plus is a fork of [doy/rbw](https://github.com/doy/rbw) aimed at letting
+AI coding agents (Claude Code, Codex, ...) use secrets from a Bitwarden or
+Vaultwarden vault without seeing their values. On top of rbw 1.15.0 it adds:
+
+* [doy/rbw#386](https://github.com/doy/rbw/pull/386): send `encryptedFor`
+  when creating or editing entries, which fixes `rbw add` and `rbw edit`
+  failing with HTTP 422 on Vaultwarden 1.37
+  ([doy/rbw#385](https://github.com/doy/rbw/issues/385)).
+* [doy/rbw#323](https://github.com/doy/rbw/pull/323): `rbw inject` and
+  `rbw run` (see [Template and command
+  injection](#template-and-command-injection)).
+* `rbw run` masks the resolved secret values in the command's stdout and
+  stderr as `<concealed by rbw>`, also when a value is split across writes.
+  `--no-masking` turns this off.
+* `rbw run --lock`, or the `lock_after_run` config option, locks the agent
+  right after resolving secrets and before starting the command, so every run
+  asks for the master password again.
+
+Status: #386 and #323 are merged as submitted. The masking and locking code is
+covered by unit tests (masking, exit status, background children), but none of
+this has been run against a live server yet, including the 422 fix and the
+password prompt after a lock. The version is bumped to `1.15.1-plus.1` so that
+a stock `rbw-agent` is not mistaken for this one.
+
+### Installing
+
+```sh
+cargo install --locked --git https://github.com/hoang3402/rbw-plus
+```
+
+This installs `rbw` and `rbw-agent` into `~/.cargo/bin`. Remove other `rbw`
+installations or put `~/.cargo/bin` first in `PATH`, since the client and the
+agent it starts must come from the same build.
+
+### Using it from an agent
+
+Keep agent secrets in vault accounts of their own (one per environment, never
+your personal password vault: an unlocked agent can read every entry of its
+account), each in its own [profile](#profiles). For production, make every
+run ask for the master password:
+
+```sh
+RBW_PROFILE=prod rbw config set email prod-secrets@example.com
+RBW_PROFILE=prod rbw config set base_url https://vault.example.com
+RBW_PROFILE=prod rbw config set pinentry pinentry-mac  # agents have no tty
+RBW_PROFILE=prod rbw config set lock_timeout 60
+RBW_PROFILE=prod rbw config set lock_after_run true
+RBW_PROFILE=prod rbw login
+```
+
+The agent then only ever sees the references in the env file:
+
+```sh
+# .env.prod
+API_TOKEN=bw://api-token
+BASE_URL=https://api.example.com
+```
+
+```sh
+RBW_PROFILE=prod rbw run --env-file .env.prod -- \
+    sh -c 'curl -fsS -H "Authorization: Bearer $API_TOKEN" "$BASE_URL/me"'
+```
+
+Use single quotes, so that `$API_TOKEN` is expanded by the child rather than
+by the outer shell (where it is empty).
+
+To keep Claude Code from reading secrets directly, add these to
+`permissions.deny` in `~/.claude/settings.json`:
+
+```json
+[
+    "Bash(rbw get *)",
+    "Bash(rbw code *)",
+    "Bash(rbw history *)",
+    "Bash(rbw edit *)",
+    "Bash(rbw inject *)",
+    "Bash(env *rbw get *)",
+    "Bash(rbw run *--no-masking*)",
+    "Bash(rbw config set *)",
+    "Bash(rbw config unset *)"
+]
+```
+
+These rules also match with a leading variable assignment
+(`RBW_PROFILE=prod rbw get ...`) and inside `&&` or `$(...)`, but not through
+`sh -c '...'`, an absolute path, or wrappers Claude Code does not strip (for
+instance `rtk rbw get ...`; add variants for those). The Claude Code docs say
+these rules "aren't a security boundary"
+([permissions](https://code.claude.com/docs/en/permissions)); use its sandbox
+to enforce them.
+
+Limits:
+
+* Masking only prevents accidental leaks. It masks exact values (and each
+  line of multi-line values); transformed values (base64, URL encoding, ...)
+  are not masked, and values shorter than 4 bytes are not masked at all (a
+  warning is printed).
+* The real barrier is typing the master password on profiles with
+  `lock_after_run`. pinentry does not show which command is asking, so cancel
+  prompts you did not expect.
+* A profile without `lock_after_run` stays readable by any command until its
+  `lock_timeout` runs out.
+* `lock_after_run` and `lock_timeout` are plain config values: anything that
+  can run `rbw config set` (or edit the profile's `config.json`) can turn them
+  off, which is why `rbw config` is in the deny list above.
+* While masking, the command's stdout and stderr are pipes, so interactive
+  programs lose their terminal (use `--no-masking`). Output that background
+  processes write more than a second after the command exits is dropped.
+
 ## Maintenance
 
 I consider `rbw` to be essentially feature-complete for me at this point. While
@@ -96,6 +207,8 @@ configuration options:
 * `pinentry`: The
   [pinentry](https://www.gnupg.org/related_software/pinentry/index.html)
   executable to use. Defaults to `pinentry`.
+* `lock_after_run`: If `true`, `rbw run` locks the agent right after
+  resolving secrets, as if `--lock` was given. Defaults to `false`.
 
 ### Profiles
 
@@ -161,6 +274,12 @@ EOF
 rbw run -- env
 rbw run --env-file .env.local -- docker compose up -d
 ```
+
+The resolved secret values are masked in the command's output as
+`<concealed by rbw>`; pass `--no-masking` to run the command with the
+terminal attached and nothing masked. `--lock` (or the `lock_after_run`
+config option) locks the agent once the secrets are resolved, before the
+command starts.
 
 *Note to users of the official Bitwarden server (at bitwarden.com)*: The
 official server has a tendency to detect command line traffic as bot traffic

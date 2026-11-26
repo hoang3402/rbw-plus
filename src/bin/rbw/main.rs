@@ -145,6 +145,18 @@ enum Opt {
             help = "Read environment bindings from an env file"
         )]
         env_file: std::path::PathBuf,
+        #[arg(
+            long,
+            help = "Lock the agent after resolving secrets, before running \
+                    the command (default for profiles with lock_after_run)"
+        )]
+        lock: bool,
+        #[arg(
+            long,
+            help = "Do not mask secret values in the command's output \
+                    (keeps the terminal attached to the command)"
+        )]
+        no_masking: bool,
         #[arg(last = true, required = true, num_args = 1..)]
         command: Vec<OsString>,
     },
@@ -417,8 +429,13 @@ fn main() {
         Opt::Inject { input, output } => {
             commands::inject(input.as_deref(), output.as_deref())
         }
-        Opt::Run { env_file, command } => commands::run(&env_file, &command)
-            .map(|status| {
+        Opt::Run {
+            env_file,
+            lock,
+            no_masking,
+            command,
+        } => commands::run(&env_file, &command, lock, no_masking).map(
+            |status| {
                 if !status.success() {
                     #[cfg(unix)]
                     if let Some(signal) = status.signal() {
@@ -426,7 +443,8 @@ fn main() {
                     }
                     std::process::exit(status.code().unwrap_or(1));
                 }
-            }),
+            },
+        ),
         Opt::Add {
             name,
             user,

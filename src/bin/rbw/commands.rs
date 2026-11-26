@@ -1273,6 +1273,11 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
             config.sync_interval = interval;
         }
         "pinentry" => config.pinentry = value.to_string(),
+        "lock_after_run" => {
+            config.lock_after_run = value
+                .parse()
+                .context("failed to parse value for lock_after_run")?;
+        }
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -1302,6 +1307,7 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
             config.lock_timeout = rbw::config::default_lock_timeout();
         }
         "pinentry" => config.pinentry = rbw::config::default_pinentry(),
+        "lock_after_run" => config.lock_after_run = false,
         _ => return Err(anyhow::anyhow!("invalid config key: {key}")),
     }
     config.save()?;
@@ -2002,10 +2008,45 @@ pub fn inject(
 pub fn run(
     env_file: &std::path::Path,
     command: &[OsString],
+    lock: bool,
+    no_masking: bool,
 ) -> anyhow::Result<std::process::ExitStatus> {
-    let ctx = InjectContext::load()?;
-    let env_bindings = ctx.env_bindings_from_file(env_file)?;
-    run_inject_command(command, &env_bindings)
+    let lock = lock || rbw::config::Config::load()?.lock_after_run;
+    let resolved = InjectContext::load()
+        .and_then(|ctx| ctx.env_bindings_from_file(env_file));
+    if lock {
+        // lock even when resolving failed, so that a failed run never leaves
+        // the agent unlocked
+        let locked = crate::actions::lock();
+        if resolved.is_ok() {
+            locked.context(
+                "failed to lock the agent after resolving secrets",
+            )?;
+        }
+    }
+    let (env_bindings, secrets) = resolved?;
+
+    if no_masking {
+        return run_inject_command(command, &env_bindings);
+    }
+    for secret in &secrets {
+        if secret.value.len() < RUN_MASK_MIN_LEN {
+            eprintln!(
+                "rbw run: value of '{}' is shorter than {RUN_MASK_MIN_LEN} \
+                 bytes and will not be masked",
+                secret.reference
+            );
+        }
+    }
+    let values: Vec<String> =
+        secrets.into_iter().map(|secret| secret.value).collect();
+    run_masked_command(
+        command,
+        &env_bindings,
+        &values,
+        std::io::stdout(),
+        std::io::stderr(),
+    )
 }
 
 fn ensure_agent() -> anyhow::Result<()> {
@@ -2856,15 +2897,24 @@ impl InjectContext {
     fn env_bindings_from_file(
         &self,
         env_file: &std::path::Path,
-    ) -> anyhow::Result<Vec<(String, String)>> {
+    ) -> anyhow::Result<(Vec<(String, String)>, Vec<ResolvedSecret>)> {
         let template =
             std::fs::read_to_string(env_file).with_context(|| {
                 format!("failed to read env file {}", env_file.display())
             })?;
-        parse_run_env_file(&template, |reference| self.resolve(reference))
-            .with_context(|| {
-                format!("failed to parse env file {}", env_file.display())
-            })
+        let mut secrets = vec![];
+        let env_bindings = parse_run_env_file(&template, |reference| {
+            let value = self.resolve(reference)?;
+            secrets.push(ResolvedSecret {
+                reference: reference.id.clone(),
+                value: value.clone(),
+            });
+            Ok(value)
+        })
+        .with_context(|| {
+            format!("failed to parse env file {}", env_file.display())
+        })?;
+        Ok((env_bindings, secrets))
     }
 
     fn resolve(&self, reference: &InjectReference) -> anyhow::Result<String> {
@@ -3498,12 +3548,268 @@ fn run_inject_command(
 ) -> anyhow::Result<std::process::ExitStatus> {
     let mut child = build_inject_run_command(command, env_bindings)?;
     child.status().with_context(|| {
-        let program = command.first().map_or_else(
-            || "<missing command>".to_string(),
-            |program| program.to_string_lossy().into_owned(),
-        );
-        format!("failed to run child command '{program}'")
+        format!(
+            "failed to run child command '{}'",
+            child_command_name(command)
+        )
     })
+}
+
+fn child_command_name(command: &[OsString]) -> String {
+    command.first().map_or_else(
+        || "<missing command>".to_string(),
+        |program| program.to_string_lossy().into_owned(),
+    )
+}
+
+const RUN_MASK: &[u8] = b"<concealed by rbw>";
+const RUN_MASK_MIN_LEN: usize = 4;
+const RUN_OUTPUT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+// a secret value resolved from a bw:// reference while loading an env file
+struct ResolvedSecret {
+    reference: String,
+    value: String,
+}
+
+// replaces secret values in a stream of output with RUN_MASK. a secret can be
+// split across reads, so a tail that could be the start of a secret is held
+// back until the next read (or the final flush).
+struct OutputMasker {
+    secrets: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+}
+
+impl OutputMasker {
+    fn new(values: &[String]) -> Self {
+        let mut secrets: Vec<Vec<u8>> = vec![];
+        for value in values {
+            // also mask each line of multi-line values (notes, pem keys)
+            let lines = value
+                .contains('\n')
+                .then(|| value.lines().map(str::trim))
+                .into_iter()
+                .flatten();
+            for part in std::iter::once(value.as_str()).chain(lines) {
+                let part = part.as_bytes();
+                if part.len() >= RUN_MASK_MIN_LEN
+                    && !secrets.iter().any(|secret| secret == part)
+                {
+                    secrets.push(part.to_vec());
+                }
+            }
+        }
+        // longest first, so that a secret containing another one is masked
+        // as a whole
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        Self {
+            secrets,
+            pending: vec![],
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(data);
+        let (masked, held_from) = self.mask(&input, true);
+        self.pending = input.split_off(held_from);
+        masked
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        let input = std::mem::take(&mut self.pending);
+        self.mask(&input, false).0
+    }
+
+    // returns the masked output and the index into `input` from which bytes
+    // were held back
+    fn mask(&self, input: &[u8], hold_partial: bool) -> (Vec<u8>, usize) {
+        let mut masked = Vec::with_capacity(input.len());
+        let mut idx = 0;
+        while let Some(rest) =
+            input.get(idx..).filter(|rest| !rest.is_empty())
+        {
+            // hold back a tail that could still grow into a longer secret,
+            // even if it already matches a shorter one
+            if hold_partial
+                && self.secrets.iter().any(|secret| {
+                    secret.len() > rest.len() && secret.starts_with(rest)
+                })
+            {
+                return (masked, idx);
+            } else if let Some(secret) =
+                self.secrets.iter().find(|secret| rest.starts_with(secret))
+            {
+                masked.extend_from_slice(RUN_MASK);
+                idx += secret.len();
+            } else {
+                masked.push(rest[0]);
+                idx += 1;
+            }
+        }
+        (masked, input.len())
+    }
+}
+
+fn write_flushed<W: std::io::Write>(
+    dst: &mut W,
+    data: &[u8],
+) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    dst.write_all(data)?;
+    dst.flush()
+}
+
+fn pump_masked_output<R, W>(mut src: R, mut dst: W, mut masker: OutputMasker)
+where
+    R: std::io::Read,
+    W: std::io::Write,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        let len = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(len) => len,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(_) => break,
+        };
+        if write_flushed(&mut dst, &masker.feed(&buf[..len])).is_err() {
+            // the reader went away (for instance `| head`). returning drops
+            // `src`, which closes the pipe, so the child gets EPIPE or
+            // SIGPIPE on its next write.
+            return;
+        }
+    }
+    write_flushed(&mut dst, &masker.flush()).ok();
+}
+
+fn run_masked_command<O, E>(
+    command: &[OsString],
+    env_bindings: &[(String, String)],
+    secrets: &[String],
+    stdout: O,
+    stderr: E,
+) -> anyhow::Result<std::process::ExitStatus>
+where
+    O: std::io::Write + Send + 'static,
+    E: std::io::Write + Send + 'static,
+{
+    let mut child_command = build_inject_run_command(command, env_bindings)?;
+    child_command.stdout(std::process::Stdio::piped());
+    child_command.stderr(std::process::Stdio::piped());
+    let mut child = child_command.spawn().with_context(|| {
+        format!(
+            "failed to run child command '{}'",
+            child_command_name(command)
+        )
+    })?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .context("child stdout was not captured")?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .context("child stderr was not captured")?;
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let stdout_done = done_tx.clone();
+    let stdout_masker = OutputMasker::new(secrets);
+    std::thread::spawn(move || {
+        pump_masked_output(child_stdout, stdout, stdout_masker);
+        stdout_done.send(()).ok();
+    });
+    let stderr_masker = OutputMasker::new(secrets);
+    std::thread::spawn(move || {
+        pump_masked_output(child_stderr, stderr, stderr_masker);
+        done_tx.send(()).ok();
+    });
+
+    let status = {
+        #[cfg(unix)]
+        let _signals = ChildSignalGuard::install(child.id());
+        child.wait().context("failed to wait for child command")?
+    };
+
+    // a background process started by the command can keep the pipes open
+    // indefinitely, so only wait a little for the remaining output
+    let deadline = std::time::Instant::now() + RUN_OUTPUT_GRACE;
+    for _ in 0..2 {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now());
+        if done_rx.recv_timeout(remaining).is_err() {
+            break;
+        }
+    }
+    Ok(status)
+}
+
+#[cfg(unix)]
+static RUN_CHILD_PID: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn forward_signal_to_child(signal: libc::c_int) {
+    let pid = RUN_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill is async-signal-safe
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+// while the child runs, SIGINT and SIGQUIT from the terminal already reach
+// the child (it is in the same process group), so they are ignored here
+// instead of killing the process that relays the child's output. SIGTERM and
+// SIGHUP sent to rbw itself are forwarded to the child.
+#[cfg(unix)]
+struct ChildSignalGuard {
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+#[cfg(unix)]
+impl ChildSignalGuard {
+    #[allow(clippy::as_conversions)] // fn pointer to sighandler_t
+    fn install(pid: u32) -> Self {
+        RUN_CHILD_PID.store(
+            i32::try_from(pid).unwrap_or(0),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let forward = forward_signal_to_child as extern "C" fn(libc::c_int)
+            as libc::sighandler_t;
+        let mut previous = vec![];
+        for (signal, handler) in [
+            (libc::SIGINT, libc::SIG_IGN),
+            (libc::SIGQUIT, libc::SIG_IGN),
+            (libc::SIGTERM, forward),
+            (libc::SIGHUP, forward),
+        ] {
+            // SAFETY: the handlers either ignore the signal or only call
+            // async-signal-safe functions
+            let old = unsafe { libc::signal(signal, handler) };
+            previous.push((signal, old));
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildSignalGuard {
+    fn drop(&mut self) {
+        for (signal, handler) in self.previous.drain(..).rev() {
+            // SAFETY: restores the handlers that were installed before
+            unsafe {
+                libc::signal(signal, handler);
+            }
+        }
+        RUN_CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn resolve_inject_value(
@@ -5785,6 +6091,177 @@ mod test {
                     .unwrap();
 
             assert_eq!(status.code(), Some(1));
+        }
+
+        fn mask_all(secrets: &[&str], chunks: &[&[u8]]) -> Vec<u8> {
+            let secrets: Vec<String> =
+                secrets.iter().map(ToString::to_string).collect();
+            let mut masker = OutputMasker::new(&secrets);
+            let mut out = vec![];
+            for chunk in chunks {
+                out.extend(masker.feed(chunk));
+            }
+            out.extend(masker.flush());
+            out
+        }
+
+        #[test]
+        fn test_output_masker_masks_whole_secret() {
+            assert_eq!(
+                mask_all(&["hunter22"], &[b"pw=hunter22\n"]),
+                b"pw=<concealed by rbw>\n"
+            );
+        }
+
+        #[test]
+        fn test_output_masker_masks_secret_split_across_reads() {
+            let input = b"a hunter22 b";
+            let chunks: Vec<&[u8]> = input.chunks(1).collect();
+            assert_eq!(
+                mask_all(&["hunter22"], &chunks),
+                b"a <concealed by rbw> b"
+            );
+        }
+
+        #[test]
+        fn test_output_masker_does_not_hold_unrelated_output() {
+            let mut masker = OutputMasker::new(&["hunter22".to_string()]);
+            assert_eq!(masker.feed(b"hello\n"), b"hello\n");
+            assert_eq!(masker.feed(b"x hunt"), b"x ");
+            assert_eq!(masker.flush(), b"hunt");
+        }
+
+        #[test]
+        fn test_output_masker_prefers_longest_secret() {
+            assert_eq!(
+                mask_all(&["abcd", "abcdefgh"], &[b"abcdefgh abcd."]),
+                b"<concealed by rbw> <concealed by rbw>."
+            );
+        }
+
+        #[test]
+        fn test_output_masker_waits_for_longer_secret_with_same_prefix() {
+            assert_eq!(
+                mask_all(&["abcd", "abcdefgh"], &[b"abcd", b"efgh"]),
+                b"<concealed by rbw>"
+            );
+            assert_eq!(
+                mask_all(&["abcd", "abcdefgh"], &[b"abcd", b"!"]),
+                b"<concealed by rbw>!"
+            );
+            assert_eq!(
+                mask_all(&["abcd", "abcdefgh"], &[b"abcd"]),
+                b"<concealed by rbw>"
+            );
+        }
+
+        #[test]
+        fn test_output_masker_skips_short_values_and_masks_lines() {
+            assert_eq!(
+                mask_all(
+                    &["abc", "line-one\nline-two\nx"],
+                    &[b"abc line-two x"]
+                ),
+                b"abc <concealed by rbw> x"
+            );
+        }
+
+        #[derive(Clone, Default)]
+        struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedOutput {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl SharedOutput {
+            fn text(&self) -> String {
+                String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            }
+        }
+
+        fn run_masked_sh(
+            script: &str,
+            env_bindings: &[(&str, &str)],
+            secrets: &[&str],
+        ) -> (std::process::ExitStatus, String, String) {
+            let stdout = SharedOutput::default();
+            let stderr = SharedOutput::default();
+            let env_bindings: Vec<(String, String)> = env_bindings
+                .iter()
+                .map(|(key, value)| {
+                    ((*key).to_string(), (*value).to_string())
+                })
+                .collect();
+            let secrets: Vec<String> =
+                secrets.iter().map(ToString::to_string).collect();
+            let status = run_masked_command(
+                &[
+                    std::ffi::OsString::from("sh"),
+                    std::ffi::OsString::from("-c"),
+                    std::ffi::OsString::from(script),
+                ],
+                &env_bindings,
+                &secrets,
+                stdout.clone(),
+                stderr.clone(),
+            )
+            .unwrap();
+            (status, stdout.text(), stderr.text())
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn test_run_masked_command_masks_stdout_and_stderr() {
+            let (status, stdout, stderr) = run_masked_sh(
+                "echo \"token=$API_TOKEN url=$BASE_URL\"; echo \"$API_TOKEN\" >&2",
+                &[
+                    ("API_TOKEN", "prod-token-9f8e7d6c"),
+                    ("BASE_URL", "https://api.example.com"),
+                ],
+                &["prod-token-9f8e7d6c"],
+            );
+            assert!(status.success());
+            assert_eq!(
+                stdout,
+                "token=<concealed by rbw> url=https://api.example.com\n"
+            );
+            assert_eq!(stderr, "<concealed by rbw>\n");
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn test_run_masked_command_masks_secret_split_across_writes() {
+            let (_, stdout, _) = run_masked_sh(
+                "printf %s \"$HEAD\"; sleep 0.2; printf '%s\\n' \"$TAIL\"",
+                &[("HEAD", "prod-to"), ("TAIL", "ken-9f8e7d6c")],
+                &["prod-token-9f8e7d6c"],
+            );
+            assert_eq!(stdout, "<concealed by rbw>\n");
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn test_run_masked_command_returns_child_exit_status() {
+            let (status, _, _) = run_masked_sh("exit 3", &[], &[]);
+            assert_eq!(status.code(), Some(3));
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn test_run_masked_command_does_not_wait_for_background_children() {
+            let started = std::time::Instant::now();
+            let (status, stdout, _) =
+                run_masked_sh("sleep 5 & echo done", &[], &[]);
+            assert!(status.success());
+            assert_eq!(stdout, "done\n");
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
         }
 
         #[test]

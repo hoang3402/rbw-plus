@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] (rbw-plus)
+
+## Added
+
+* `rbw run` masks the resolved secret values in the command's stdout and
+  stderr; `--no-masking` disables it.
+* `rbw run --lock` and the `lock_after_run` config option lock the agent
+  after resolving secrets, before the command starts.
+
+## Fixed
+
+* `rbw add` and `rbw edit` work against Vaultwarden 1.37 again (doy/rbw#386).
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
